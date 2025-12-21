@@ -56,35 +56,7 @@ Initial State
     ↓ (Refund by depositor)
 FUNDS REFUNDED
 ```
-flowchart TD
-subgraph OffChain[Off-Chain Layer]
-D[Depositor Wallet]
-B[Beneficiary Wallet]
-O1[Official 1]
-O2[Official 2]
-EP[Contract Endpoints]
-end
 
-
-subgraph OnChain[On-Chain Layer]
-V[Validator Script]
-DT[EscrowDatum]
-RD[EscrowAction Redeemer]
-end
-
-
-L[Cardano Ledger / UTxO Set]
-
-
-D --> EP
-B --> EP
-O1 --> EP
-O2 --> EP
-EP --> V
-V --> L
-L --> V
-V --> DT
-V --> RD
 ---
 
 ## 🔐 Security Design
