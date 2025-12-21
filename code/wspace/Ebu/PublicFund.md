@@ -181,16 +181,16 @@ Estimated Costs (approximate):
 ### **Scenario 1: Successful Fund Release**
 ```
 Initial: 0 approvals, deadline = t+30d
-Day 10: Official A approves → 1 approval
-Day 15: Official B approves → 2 approvals
-Day 20: Beneficiary releases funds → SUCCESS
+Official A approves → 1 approval
+Official B approves → 2 approvals
+Beneficiary releases funds → SUCCESS
 ```
 
 ### **Scenario 2: Timeout Refund**
 ```
 Initial: 0 approvals, deadline = t+30d
-Day 10: Official A approves → 1 approval
-Day 35: Deadline passed, only 1 approval (< n)
+Official A approves → 1 approval
+Deadline passed, only 1 approval (< n)
 Depositor executes refund → SUCCESS
 ```
 
