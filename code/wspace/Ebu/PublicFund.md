@@ -18,11 +18,6 @@ Traditional fund management systems often suffer from:
 5. **Flexible** m-of-n threshold configuration
 6. **Non-repudiation** of approvals
 
-
-Depositor -->|Locks Funds| SmartContract
-Officials -->|Approve| SmartContract
-SmartContract -->|Release| Beneficiary
-SmartContract -->|Refund| Depositor
 ---
 
 ## 🏗️ Architecture & Design
