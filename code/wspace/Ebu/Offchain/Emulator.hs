@@ -6,18 +6,17 @@
 
 module Main where
 
--- base
 import Control.Monad (void)
 
--- ledger / plutus
+-- Plutus
 import Ledger
 import Ledger.Ada as Ada
 import Plutus.Contract
 import Plutus.Trace.Emulator as Emulator
 import Wallet.Emulator.Wallet
 
--- reuse YOUR on-chain code
-import OnChain.PublicFund
+-- Your on-chain code
+import PublicFund
 
 ------------------------------------------------------------
 -- Schema
@@ -37,49 +36,72 @@ escrowAddress :: Address
 escrowAddress = scriptAddress validator
 
 ------------------------------------------------------------
--- Datum
+-- Datum helpers
 ------------------------------------------------------------
 
-mkDatum :: Wallet -> Wallet -> [Wallet] -> POSIXTime -> EscrowDatum
-mkDatum depositor beneficiary officials deadline =
+mkDatum :: [PaymentPubKeyHash] -> EscrowDatum
+mkDatum approvals =
     EscrowDatum
-        { edDepositor   = mockWalletPaymentPubKeyHash depositor
-        , edBeneficiary = mockWalletPaymentPubKeyHash beneficiary
-        , edOfficials   = fmap mockWalletPaymentPubKeyHash officials
-        , edApprovals   = []
+        { edDepositor   = mockWalletPaymentPubKeyHash $ knownWallet 1
+        , edBeneficiary = mockWalletPaymentPubKeyHash $ knownWallet 2
+        , edOfficials   =
+            fmap mockWalletPaymentPubKeyHash
+                [ knownWallet 3
+                , knownWallet 4
+                ]
+        , edApprovals   = approvals
         , edRequired    = 2
-        , edDeadline    = deadline
+        , edDeadline    = 20_000
         }
 
 ------------------------------------------------------------
--- Endpoints
+-- Lock funds
 ------------------------------------------------------------
 
 lock :: Contract () EscrowSchema Text ()
 lock = do
-    let datum =
-            mkDatum (knownWallet 1) (knownWallet 2)
-                    [knownWallet 3, knownWallet 4]
-                    20_000
-
+    let datum = mkDatum []
         tx =
             mustPayToTheScript datum
                 (Ada.lovelaceValueOf 10_000_000)
 
     void $ submitTxConstraints validator tx
 
-approve :: Contract () EscrowSchema Text ()
-approve = do
+------------------------------------------------------------
+-- Approve (updates datum!)
+------------------------------------------------------------
+
+approve :: Wallet -> Contract () EscrowSchema Text ()
+approve w = do
     utxos <- utxosAt escrowAddress
     case utxos of
-        [(oref, _)] ->
-            void $
-              submitTxConstraintsSpending
-                validator
-                utxos
-                (mustSpendScriptOutput oref
-                    (Redeemer $ toBuiltinData Approve))
-        _ -> logError @String "No script UTxO"
+        [(oref, o)] -> do
+            let oldDatum =
+                    case _ciTxOutDatum o of
+                        Left _          -> traceError "no datum"
+                        Right (Datum d) -> unsafeFromBuiltinData d
+
+                signer = mockWalletPaymentPubKeyHash w
+
+                newDatum =
+                    oldDatum
+                        { edApprovals =
+                            signer : edApprovals oldDatum
+                        }
+
+                tx =
+                    mustSpendScriptOutput oref
+                        (Redeemer $ toBuiltinData Approve)
+                    <> mustPayToTheScript newDatum
+                        (Ada.lovelaceValueOf 10_000_000)
+
+            void $ submitTxConstraintsSpending validator utxos tx
+
+        _ -> logError @String "expected exactly one script UTxO"
+
+------------------------------------------------------------
+-- Release
+------------------------------------------------------------
 
 release :: Contract () EscrowSchema Text ()
 release = do
@@ -92,7 +114,24 @@ release = do
                 utxos
                 (mustSpendScriptOutput oref
                     (Redeemer $ toBuiltinData Release))
-        _ -> logError @String "No script UTxO"
+        _ -> logError @String "no script utxo"
+
+------------------------------------------------------------
+-- Refund
+------------------------------------------------------------
+
+refund :: Contract () EscrowSchema Text ()
+refund = do
+    utxos <- utxosAt escrowAddress
+    case utxos of
+        [(oref, _)] ->
+            void $
+              submitTxConstraintsSpending
+                validator
+                utxos
+                (mustSpendScriptOutput oref
+                    (Redeemer $ toBuiltinData Refund))
+        _ -> logError @String "no script utxo"
 
 ------------------------------------------------------------
 -- Emulator trace
@@ -100,15 +139,18 @@ release = do
 
 trace :: EmulatorTrace ()
 trace = do
+    -- Wallet 1 locks funds
     h1 <- activateContractWallet (knownWallet 1) lock
     void $ Emulator.waitNSlots 1
 
-    h3 <- activateContractWallet (knownWallet 3) approve
+    -- Officials approve
+    h3 <- activateContractWallet (knownWallet 3) (approve $ knownWallet 3)
     void $ Emulator.waitNSlots 1
 
-    h4 <- activateContractWallet (knownWallet 4) approve
+    h4 <- activateContractWallet (knownWallet 4) (approve $ knownWallet 4)
     void $ Emulator.waitNSlots 1
 
+    -- Beneficiary releases
     h2 <- activateContractWallet (knownWallet 2) release
     void $ Emulator.waitNSlots 1
 
