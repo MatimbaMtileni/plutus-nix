@@ -7,18 +7,16 @@
 
 module Main where
 
-import Prelude (IO, String, FilePath, drop, putStrLn, (<>))
+import Prelude (IO, FilePath, putStrLn, (<>), String)
 import qualified Prelude as P
 import qualified Data.Text as T
 
 import Plutus.V2.Ledger.Api
 import Plutus.V2.Ledger.Contexts
 import qualified Plutus.V2.Ledger.Api as PlutusV2
-import Plutus.V1.Ledger.Interval as Interval
-import Plutus.V1.Ledger.Value (valueOf, adaSymbol, adaToken)
+
 import PlutusTx
 import PlutusTx.Prelude hiding (Semigroup(..), unless)
-import qualified PlutusTx.Builtins as Builtins
 
 import qualified Codec.Serialise as Serialise
 import qualified Data.ByteString.Lazy  as LBS
@@ -34,10 +32,10 @@ import qualified Cardano.Api.Shelley as CS
 -------------------------------------------------------------------------------
 
 data CircleDatum = CircleDatum
-    { cdParticipants :: [PubKeyHash]  -- list of all N people
-    , cdAmount       :: Integer       -- fixed deposit amount
-    , cdOrder        :: [PubKeyHash]  -- predetermined payout order
-    , cdRound        :: Integer       -- current payout round index
+    { cdParticipants :: [PubKeyHash]
+    , cdAmount       :: Integer
+    , cdOrder        :: [PubKeyHash]
+    , cdRound        :: Integer
     }
 PlutusTx.unstableMakeIsData ''CircleDatum
 
@@ -53,17 +51,12 @@ signedBy :: PubKeyHash -> ScriptContext -> Bool
 signedBy pkh ctx =
     txSignedBy (scriptContextTxInfo ctx) pkh
 
-{-# INLINABLE getInputAda #-}
-getInputAda :: TxOut -> Integer
-getInputAda o =
-    valueOf (txOutValue o) adaSymbol adaToken
-
-{-# INLINABLE getContinuing #-}
-getContinuing :: ScriptContext -> TxOut
-getContinuing ctx =
+{-# INLINABLE getOnlyContinuing #-}
+getOnlyContinuing :: ScriptContext -> TxOut
+getOnlyContinuing ctx =
     case getContinuingOutputs ctx of
         [o] -> o
-        _   -> traceError "expected one continuing output"
+        _   -> traceError "expected exactly one continuing output"
 
 {-# INLINABLE indexList #-}
 indexList :: [a] -> Integer -> Maybe a
@@ -71,9 +64,7 @@ indexList xs idx = go xs idx
   where
     go [] _ = Nothing
     go (y:ys) i =
-        if i == 0
-            then Just y
-            else go ys (i - 1)
+        if i == 0 then Just y else go ys (i - 1)
 
 {-# INLINABLE currentBeneficiary #-}
 currentBeneficiary :: CircleDatum -> PubKeyHash
@@ -81,7 +72,6 @@ currentBeneficiary dat =
     case indexList (cdOrder dat) (cdRound dat) of
         Just p  -> p
         Nothing -> traceError "invalid round index"
-
 
 -------------------------------------------------------------------------------
 -- VALIDATOR
@@ -91,62 +81,58 @@ currentBeneficiary dat =
 mkCircleValidator :: CircleDatum -> CircleAction -> ScriptContext -> Bool
 mkCircleValidator dat action ctx =
     case action of
+
         -----------------------------------------------------------------------
-        -- 1. DEPOSIT: everyone deposits fixed amount
+        -- DEPOSIT
         -----------------------------------------------------------------------
         Deposit ->
             traceIfFalse "deposit must be signed by participant"
                 signedAnyParticipant
             &&
-            traceIfFalse "must increase contract balance"
-                depositCorrect
+            traceIfFalse "must have exactly one continuing output"
+                hasOneContinuing
 
         -----------------------------------------------------------------------
-        -- 2. PAYOUT: Only scheduled beneficiary receives funds
+        -- PAYOUT
         -----------------------------------------------------------------------
         Payout ->
-            traceIfFalse "wrong beneficiary" correctBeneficiary
+            traceIfFalse "wrong beneficiary"
+                correctBeneficiary
             &&
-            traceIfFalse "payout must reduce contract balance"
-                payoutCorrect
+            traceIfFalse "must have exactly one continuing output"
+                hasOneContinuing
             &&
-            traceIfFalse "round must advance"
+            traceIfFalse "round must increment"
                 roundIncremented
 
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
 
-    input :: TxOut
-    input = case findOwnInput ctx of
-        Just i  -> txInInfoResolved i
-        Nothing -> traceError "no input"
-
-    inAda  = getInputAda input
-    out    = getContinuing ctx
-    outAda = getInputAda out
-
+    signedAnyParticipant :: Bool
     signedAnyParticipant =
         any (\pkh -> signedBy pkh ctx) (cdParticipants dat)
 
-    depositCorrect =
-        outAda == inAda + cdAmount dat
+    hasOneContinuing :: Bool
+    hasOneContinuing =
+        length (getContinuingOutputs ctx) == 1
 
+    correctBeneficiary :: Bool
+    correctBeneficiary =
+        signedBy (currentBeneficiary dat) ctx
 
-    correctBeneficiary = signedBy (currentBeneficiary dat) ctx
-
-
-    payoutCorrect =
-        outAda == inAda - (cdAmount dat * P.fromInteger (P.toInteger (length (cdParticipants dat))))
-
+    roundIncremented :: Bool
     roundIncremented =
-        case txOutDatum out of
-            OutputDatum (Datum d) ->
-                case PlutusTx.fromBuiltinData d of
-                    Just newDat ->
-                        cdRound newDat == (cdRound dat + 1)
-                    _ -> traceError "invalid updated datum"
-            _ -> traceError "round must update via datum"
+        case getContinuingOutputs ctx of
+            [o] ->
+                case txOutDatum o of
+                    OutputDatum (Datum d) ->
+                        case PlutusTx.fromBuiltinData d of
+                            Just newDat ->
+                                cdRound newDat == cdRound dat + 1
+                            _ -> traceError "invalid updated datum"
+                    _ -> traceError "datum must be inline"
+            _ -> traceError "expected one continuing output"
 
 -------------------------------------------------------------------------------
 -- UNTYPED WRAPPER
@@ -162,7 +148,8 @@ mkValidatorUntyped d r c =
     else error ()
 
 validator :: Validator
-validator = mkValidatorScript $$(PlutusTx.compile [|| mkValidatorUntyped ||])
+validator =
+    mkValidatorScript $$(PlutusTx.compile [|| mkValidatorUntyped ||])
 
 -------------------------------------------------------------------------------
 -- ADDRESS & CBOR GENERATION
@@ -173,11 +160,11 @@ plutusValidatorHash val =
     let bytes    = Serialise.serialise val
         short    = SBS.toShort (LBS.toStrict bytes)
         strictBS = SBS.fromShort short
-        builtin  = Builtins.toBuiltin strictBS
-    in PlutusV2.ValidatorHash builtin
+    in PlutusV2.ValidatorHash (toBuiltin strictBS)
 
 plutusScriptAddress :: Address
-plutusScriptAddress = Address (ScriptCredential (plutusValidatorHash validator)) Nothing
+plutusScriptAddress =
+    Address (ScriptCredential (plutusValidatorHash validator)) Nothing
 
 toBech32ScriptAddress :: C.NetworkId -> Validator -> String
 toBech32ScriptAddress network val =
@@ -186,11 +173,15 @@ toBech32ScriptAddress network val =
         plutusScript = CS.PlutusScriptSerialised serialised
         scriptHash = C.hashScript (C.PlutusScript C.PlutusScriptV2 plutusScript)
         shelleyAddr :: C.AddressInEra C.BabbageEra
-        shelleyAddr = C.makeShelleyAddressInEra network (C.PaymentCredentialByScript scriptHash) C.NoStakeAddress
+        shelleyAddr =
+            C.makeShelleyAddressInEra
+                network
+                (C.PaymentCredentialByScript scriptHash)
+                C.NoStakeAddress
     in T.unpack (C.serialiseAddress shelleyAddr)
 
 -------------------------------------------------------------------------------
--- FILE WRITING (PLUTUS + CBOR)
+-- FILE OUTPUT
 -------------------------------------------------------------------------------
 
 writeValidator :: FilePath -> Validator -> IO ()
@@ -205,7 +196,6 @@ writeCBOR path val = do
     BS.writeFile path hex
     putStrLn $ "CBOR hex written to: " <> path
 
-
 -------------------------------------------------------------------------------
 -- MAIN
 -------------------------------------------------------------------------------
@@ -214,16 +204,7 @@ main :: IO ()
 main = do
     let network = C.Testnet (C.NetworkMagic 1)
 
-    -- Write .plutus and .cbor hex
     writeValidator "circle.plutus" validator
     writeCBOR "circle.cbor" validator
 
-    let vh     = plutusValidatorHash validator
-        addr   = plutusScriptAddress
-        bech32 = toBech32ScriptAddress network validator
-
-    putStrLn "\n--- On-chain Savings Circle Info ---"
-    putStrLn $ "Validator Hash: " <> P.show vh
-    putStrLn $ "On-chain Script Address: " <> P.show addr
-    putStrLn $ "Bech32 Script Address: " <> bech32
-    putStrLn "--------------------------------------"
+    putStrLn "Savings Circle validator generated successfully."

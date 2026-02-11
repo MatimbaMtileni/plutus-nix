@@ -34,7 +34,7 @@ import qualified Cardano.Api.Shelley as CS
 
 data YieldDatum = YieldDatum
     { ydLender     :: PubKeyHash
-    , ydBorrower   :: PubKeyHash
+    , ydBorrower   :: Maybe PubKeyHash   -- ✅ FIX: borrower is optional
     , ydPrincipal  :: Integer
     , ydInterest   :: Integer
     , ydYieldShare :: Integer
@@ -58,7 +58,13 @@ PlutusTx.unstableMakeIsData ''YieldAction
 
 {-# INLINABLE signedBy #-}
 signedBy :: PubKeyHash -> ScriptContext -> Bool
-signedBy pkh ctx = txSignedBy (scriptContextTxInfo ctx) pkh
+signedBy pkh ctx =
+    txSignedBy (scriptContextTxInfo ctx) pkh
+
+{-# INLINABLE anySigner #-}
+anySigner :: ScriptContext -> Bool
+anySigner ctx =
+    length (txInfoSignatories (scriptContextTxInfo ctx)) > 0
 
 {-# INLINABLE calcDistribution #-}
 calcDistribution :: Integer -> Integer -> (Integer, Integer)
@@ -66,6 +72,24 @@ calcDistribution yield ratio =
     let lenderPart   = (yield * ratio) `divide` 100
         borrowerPart = yield - lenderPart
     in (lenderPart, borrowerPart)
+
+{-# INLINABLE adaPaidTo #-}
+adaPaidTo :: TxInfo -> PubKeyHash -> Integer
+adaPaidTo info pkh =
+    valueOf (valuePaidTo info pkh) adaSymbol adaToken
+
+{-# INLINABLE ownInputAda #-}
+ownInputAda :: ScriptContext -> Integer
+ownInputAda ctx =
+    case findOwnInput ctx of
+        Nothing ->
+            traceError "script input missing"
+
+        Just txIn ->
+            valueOf
+                (txOutValue (txInInfoResolved txIn))
+                adaSymbol
+                adaToken
 
 -----------------------------------------------------------------------------------
 -- Validator
@@ -75,17 +99,67 @@ calcDistribution yield ratio =
 mkYieldValidator :: YieldDatum -> YieldAction -> ScriptContext -> Bool
 mkYieldValidator dat action ctx =
     case action of
+
         Deposit ->
-            traceIfFalse "lender must sign" (signedBy (ydLender dat) ctx)
+            traceIfFalse "lender must sign!"
+              (signedBy (ydLender dat) ctx)
 
-        Borrow amt ->
-            traceIfFalse "borrower must sign" (signedBy (ydBorrower dat) ctx)
+        Borrow _ ->
+            case ydBorrower dat of
+                Nothing ->
+                    -- ✅ First borrower: ANY signer allowed
+                    traceIfFalse "borrower must sign!"
+                      (anySigner ctx)
 
-        Repay amt ->
-            traceIfFalse "borrower must sign" (signedBy (ydBorrower dat) ctx)
+                Just borrower ->
+                    traceIfFalse "borrower must sign!"
+                      (signedBy borrower ctx)
+
+        Repay _ ->
+            case ydBorrower dat of
+                Nothing ->
+                    traceError "no borrower to repay"
+
+                Just borrower ->
+                    traceIfFalse "borrower must sign"
+                      (signedBy borrower ctx)
 
         DistributeYield yieldAmt ->
-            traceIfFalse "must be signed by lender" (signedBy (ydLender dat) ctx)
+            traceIfFalse "lender must sign"
+                (signedBy (ydLender dat) ctx) &&
+
+            case ydBorrower dat of
+                Nothing ->
+                    traceError "no borrower"
+
+                Just borrower ->
+                    let
+                        info = scriptContextTxInfo ctx
+
+                        requiredRepayment =
+                            ydPrincipal dat + ydInterest dat
+
+                        scriptAda =
+                            ownInputAda ctx
+
+                        (lenderShare, borrowerShare) =
+                            calcDistribution yieldAmt (ydYieldShare dat)
+
+                        lenderPaid =
+                            adaPaidTo info (ydLender dat)
+
+                        borrowerPaid =
+                            adaPaidTo info borrower
+                    in
+                        traceIfFalse "loan not repaid"
+                            (scriptAda >= requiredRepayment) &&
+
+                        traceIfFalse "lender not paid correctly"
+                            (lenderPaid >= lenderShare) &&
+
+                        traceIfFalse "borrower not paid correctly"
+                            (borrowerPaid >= borrowerShare)
+
 
 -----------------------------------------------------------------------------------
 -- Untyped
@@ -101,7 +175,8 @@ mkValidatorUntyped d r c =
     else error ()
 
 validator :: Validator
-validator = mkValidatorScript $$(PlutusTx.compile [|| mkValidatorUntyped ||])
+validator =
+    mkValidatorScript $$(PlutusTx.compile [|| mkValidatorUntyped ||])
 
 -----------------------------------------------------------------------------------
 -- Script Hash + Address
@@ -116,7 +191,8 @@ plutusValidatorHash val =
     in PlutusV2.ValidatorHash builtin
 
 plutusScriptAddress :: Address
-plutusScriptAddress = Address (ScriptCredential (plutusValidatorHash validator)) Nothing
+plutusScriptAddress =
+    Address (ScriptCredential (plutusValidatorHash validator)) Nothing
 
 -----------------------------------------------------------------------------------
 -- Bech32
@@ -128,10 +204,11 @@ toBech32ScriptAddress network val =
         plutusScript = CS.PlutusScriptSerialised serialised
         scriptHash   = C.hashScript (C.PlutusScript C.PlutusScriptV2 plutusScript)
         shelleyAddr :: C.AddressInEra C.BabbageEra
-        shelleyAddr  = C.makeShelleyAddressInEra
-                          network
-                          (C.PaymentCredentialByScript scriptHash)
-                          C.NoStakeAddress
+        shelleyAddr  =
+            C.makeShelleyAddressInEra
+                network
+                (C.PaymentCredentialByScript scriptHash)
+                C.NoStakeAddress
     in T.unpack (C.serialiseAddress shelleyAddr)
 
 -----------------------------------------------------------------------------------
@@ -175,11 +252,9 @@ main = do
         bech32  = toBech32ScriptAddress network validator
         cborHex = validatorToCBORHex validator
 
-    -- Save files
     writeValidator "yieldsharing.plutus" validator
     writeCBOR      "yieldsharing.cbor"   validator
 
-    -- Print info
     putStrLn "--- Yield Sharing Lending Contract ---"
     putStrLn $ "Bech32 Script Address: " <> bech32
     putStrLn $ "CBOR Hex (first 120 chars): " <> P.take 120 cborHex <> "..."
